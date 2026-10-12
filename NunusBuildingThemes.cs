@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using Newtonsoft.Json;
 using Oxide.Core;
@@ -9,284 +10,288 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("NunusBuildingThemes", "Rust dos Nunus", "2.1.0")]
-    [Description("Visual construction theme selector with separately enabled, time-limited mechanics testing.")]
+    [Info("NunusBuildingThemes", "Rust dos Nunus", "3.0.0")]
+    [Description("Building theme selector with controlled, time-limited testing on real upgrades.")]
     public class NunusBuildingThemes : RustPlugin
     {
         [PluginReference] private Plugin ImageLibrary;
-        private const string PermUse = "nunusbuildingthemes.use";
-        private const string PermAdmin = "nunusbuildingthemes.admin";
-        private const string Root = "NunusBuildingThemes.Root";
-        private readonly Dictionary<ulong, string> selectedGrade = new Dictionary<ulong, string>();
-        private readonly Dictionary<ulong, int> page = new Dictionary<ulong, int>();
-        private Data saved;
+        private const string UsePerm = "nunusbuildingthemes.use";
+        private const string AdminPerm = "nunusbuildingthemes.admin";
+        private const string Root = "NunusBuildingThemes.UI";
+        private const int PageSize = 6;
         private Settings settings;
-        private DateTime testingUntilUtc = DateTime.MinValue;
-        private readonly HashSet<string> queuedPreviews = new HashSet<string>();
+        private Store store;
+        private readonly Dictionary<ulong, string> tabs = new Dictionary<ulong, string>();
+        private readonly Dictionary<ulong, int> pages = new Dictionary<ulong, int>();
+        private DateTime testingUntil = DateTime.MinValue;
 
         private class Theme
         {
-            [JsonProperty("Name")] public string Name;
             [JsonProperty("Grade")] public string Grade;
+            [JsonProperty("Name")] public string Name;
             [JsonProperty("SkinId")] public ulong SkinId;
-            [JsonProperty("PreviewImageKey")] public string PreviewImageKey;
             [JsonProperty("PreviewImageUrl")] public string PreviewImageUrl;
+            [JsonProperty("PreviewImageKey")] public string PreviewImageKey;
         }
         private class Settings
         {
-            [JsonProperty("Themes")] public List<Theme> Themes = new List<Theme>
-            {
-                new Theme {Name="Padrão", Grade="Wood", SkinId=0},
-                new Theme {Name="Legacy Wood (configure ID)", Grade="Wood", SkinId=0},
-                new Theme {Name="Padrão", Grade="Stone", SkinId=0},
-                new Theme {Name="Adobe", Grade="Stone", SkinId=10220},
-                new Theme {Name="Brick", Grade="Stone", SkinId=10223},
-                new Theme {Name="Brutalist", Grade="Stone", SkinId=10225},
-                new Theme {Name="Jungle (configure ID)", Grade="Stone", SkinId=0},
-                new Theme {Name="Crypt (configure ID)", Grade="Stone", SkinId=0},
-                new Theme {Name="Padrão", Grade="Metal", SkinId=0},
-                new Theme {Name="Shipping Container", Grade="Metal", SkinId=10221},
-                new Theme {Name="Padrão", Grade="TopTier", SkinId=0},
-                new Theme {Name="Space Station (configure ID)", Grade="TopTier", SkinId=0}
-            };
-            [JsonProperty("EnableTemporaryTestApplication (admin only)")] public bool EnableTemporaryTestApplication = false;
+            [JsonProperty("EnableTemporaryTestApplication (admin only)")]
+            public bool EnableTemporaryTestApplication = false;
             [JsonProperty("MaximumTestMinutes")] public int MaximumTestMinutes = 30;
+            [JsonProperty("Themes")] public List<Theme> Themes = Defaults();
         }
-        private class Data
+        private class Store
         {
             public Dictionary<ulong, Dictionary<string, ulong>> Preferences = new Dictionary<ulong, Dictionary<string, ulong>>();
         }
-
-        protected override void LoadDefaultConfig() { settings = new Settings(); Config.WriteObject(settings, true); }
-        private void LoadSettings()
+        private static List<Theme> Defaults()
         {
-            try { settings = Config.ReadObject<Settings>(); }
-            catch { PrintWarning("Invalid config, using defaults."); settings = new Settings(); }
-            if (settings == null || settings.Themes == null) settings = new Settings();
-            settings.MaximumTestMinutes = Math.Max(1, Math.Min(60, settings.MaximumTestMinutes));
+            return new List<Theme>
+            {
+                new Theme { Grade="Wood", Name="Padrão", SkinId=0 },
+                new Theme { Grade="Wood", Name="Frontier", SkinId=10232 },
+                new Theme { Grade="Stone", Name="Padrão", SkinId=0 },
+                new Theme { Grade="Stone", Name="Adobe", SkinId=10220 },
+                new Theme { Grade="Stone", Name="Brick", SkinId=10223 },
+                new Theme { Grade="Stone", Name="Brutalist", SkinId=10225 },
+                new Theme { Grade="Stone", Name="Jungle", SkinId=10326 },
+                new Theme { Grade="Metal", Name="Padrão", SkinId=0 },
+                new Theme { Grade="Metal", Name="Shipping Container", SkinId=10221 },
+                new Theme { Grade="TopTier", Name="Padrão", SkinId=0 },
+                new Theme { Grade="TopTier", Name="Space Station", SkinId=10430 }
+            };
+        }
+        protected override void LoadDefaultConfig()
+        {
+            settings = new Settings();
+            Config.WriteObject(settings, true);
         }
         private void Init()
         {
-            permission.RegisterPermission(PermUse, this);
-            permission.RegisterPermission(PermAdmin, this);
-            LoadSettings();
-            try { saved = Interface.Oxide.DataFileSystem.ReadObject<Data>(Name); }
-            catch { saved = new Data(); }
-            if (saved == null || saved.Preferences == null) saved = new Data();
+            permission.RegisterPermission(UsePerm, this);
+            permission.RegisterPermission(AdminPerm, this);
+            ReadSettings();
+            try { store = Interface.Oxide.DataFileSystem.ReadObject<Store>(Name); }
+            catch { store = new Store(); }
+            if (store == null || store.Preferences == null) store = new Store();
         }
-        private void OnServerInitialized() { timer.Once(3f, RegisterPreviews); }
-        private void OnPluginLoaded(Plugin plugin)
+        private void ReadSettings()
         {
-            if (plugin != null && plugin.Name == "ImageLibrary")
-                timer.Once(2f, RegisterPreviews);
+            try { settings = Config.ReadObject<Settings>(); }
+            catch { PrintWarning("Invalid config; default themes loaded (config not overwritten)."); settings = new Settings(); }
+            if (settings == null) settings = new Settings();
+            if (settings.Themes == null) settings.Themes = Defaults();
+            settings.MaximumTestMinutes = Math.Max(1, Math.Min(60, settings.MaximumTestMinutes));
+            // Avoid duplicates, invalid grades and unfinished placeholders.
+            settings.Themes = settings.Themes
+                .Where(t => t != null && (t.Grade == "Wood" || t.Grade == "Stone" || t.Grade == "Metal" || t.Grade == "TopTier")
+                    && !String.IsNullOrWhiteSpace(t.Name) && (t.SkinId != 0 || t.Name == "Padrão"))
+                .GroupBy(t => t.Grade + "|" + t.SkinId, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First()).ToList();
+            foreach (var grade in new[] { "Wood", "Stone", "Metal", "TopTier" })
+                if (!settings.Themes.Any(t => t.Grade == grade && t.SkinId == 0))
+                    settings.Themes.Insert(0, new Theme { Grade = grade, Name = "Padrão", SkinId = 0 });
         }
-        private void RegisterPreviews()
-        {
-            if (ImageLibrary == null || settings == null || settings.Themes == null) return;
-            foreach (var theme in settings.Themes)
-            {
-                if (theme == null || String.IsNullOrWhiteSpace(theme.PreviewImageUrl)) continue;
-                if (!Uri.IsWellFormedUriString(theme.PreviewImageUrl, UriKind.Absolute)) continue;
-                Uri url;
-                if (!Uri.TryCreate(theme.PreviewImageUrl, UriKind.Absolute, out url) || url.Scheme != Uri.UriSchemeHttps) continue;
-                string key = PreviewKey(theme);
-                if (queuedPreviews.Contains(key)) continue;
-                bool cached = false;
-                try { var found = ImageLibrary.Call("HasImage", key, (ulong)0); cached = found is bool && (bool)found; }
-                catch (Exception ex) { PrintWarning("Image Library indisponível: " + ex.Message); }
-                if (cached) continue;
-                queuedPreviews.Add(key);
-                try
-                {
-                    ImageLibrary.Call("AddImage", theme.PreviewImageUrl, key, (ulong)0, new Action(() =>
-                    {
-                        foreach (var player in BasePlayer.activePlayerList)
-                            if (player != null && player.IsConnected && selectedGrade.ContainsKey(player.userID)) Draw(player);
-                    }));
-                }
-                catch (Exception ex)
-                {
-                    queuedPreviews.Remove(key);
-                    PrintWarning("Falha ao registrar imagem de " + theme.Name + ": " + ex.Message);
-                }
-            }
-        }
-        private string PreviewKey(Theme theme)
-        {
-            return !String.IsNullOrWhiteSpace(theme.PreviewImageKey)
-                ? theme.PreviewImageKey
-                : "nunusbuild_" + theme.Grade.ToLowerInvariant() + "_" + theme.SkinId;
-        }
-        private void SaveData() { Interface.Oxide.DataFileSystem.WriteObject(Name, saved); }
+        private void OnServerInitialized() { RegisterImages(); }
         private void Unload()
         {
             foreach (var player in BasePlayer.activePlayerList) CuiHelper.DestroyUi(player, Root);
-            SaveData();
+            Interface.Oxide.DataFileSystem.WriteObject(Name, store);
+            testingUntil = DateTime.MinValue;
         }
-        private void OnPlayerDisconnected(BasePlayer player, string reason)
+        private bool CanUse(BasePlayer p) { return p != null && p.IsConnected && permission.UserHasPermission(p.UserIDString, UsePerm); }
+        private bool Admin(BasePlayer p) { return p != null && permission.UserHasPermission(p.UserIDString, AdminPerm); }
+        private bool Testing() { return settings.EnableTemporaryTestApplication && DateTime.UtcNow < testingUntil; }
+        private static string GradeKey(BuildingGrade.Enum grade)
         {
-            if (player != null) { selectedGrade.Remove(player.userID); page.Remove(player.userID); }
+            switch (grade)
+            {
+                case BuildingGrade.Enum.Wood: return "Wood";
+                case BuildingGrade.Enum.Stone: return "Stone";
+                case BuildingGrade.Enum.Metal: return "Metal";
+                case BuildingGrade.Enum.TopTier: return "TopTier";
+                default: return null;
+            }
         }
-        private bool IsAdmin(BasePlayer player) => player != null && permission.UserHasPermission(player.UserIDString, PermAdmin);
-        private bool CanUse(BasePlayer player) => player != null && player.IsConnected && permission.UserHasPermission(player.UserIDString, PermUse);
-        private string GradeName(string g) => g == "Wood" ? "MADEIRA" : g == "Stone" ? "PEDRA" : g == "Metal" ? "METAL" : "BLINDADO";
-        private string GradeFromEnum(BuildingGrade.Enum grade)
+        private ulong Preference(ulong id, string grade)
         {
-            if (grade == BuildingGrade.Enum.Wood) return "Wood";
-            if (grade == BuildingGrade.Enum.Stone) return "Stone";
-            if (grade == BuildingGrade.Enum.Metal) return "Metal";
-            if (grade == BuildingGrade.Enum.TopTier) return "TopTier";
-            return null;
+            Dictionary<string, ulong> values;
+            ulong selected;
+            return store.Preferences.TryGetValue(id, out values) && values.TryGetValue(grade, out selected) ? selected : 0;
         }
-        private ulong Preference(ulong user, string grade)
+        private void SetPreference(ulong id, string grade, ulong skin)
         {
-            Dictionary<string, ulong> items;
-            ulong value;
-            return saved.Preferences.TryGetValue(user, out items) && items.TryGetValue(grade, out value) ? value : 0;
+            Dictionary<string, ulong> values;
+            if (!store.Preferences.TryGetValue(id, out values))
+            {
+                values = new Dictionary<string, ulong>();
+                store.Preferences[id] = values;
+            }
+            values[grade] = skin;
+            Interface.Oxide.DataFileSystem.WriteObject(Name, store);
         }
-        private void SetPreference(ulong user, string grade, ulong id)
+        private Theme FindTheme(string grade, ulong id)
         {
-            Dictionary<string, ulong> items;
-            if (!saved.Preferences.TryGetValue(user, out items)) { items = new Dictionary<string, ulong>(); saved.Preferences[user] = items; }
-            items[grade] = id;
-            SaveData();
+            return settings.Themes.FirstOrDefault(t => t.Grade == grade && t.SkinId == id);
         }
-        private bool IsListed(string grade, ulong id) => settings.Themes.Any(x => x.Grade == grade && x.SkinId == id);
-
+        private void RegisterImages()
+        {
+            if (ImageLibrary == null) return;
+            foreach (var t in settings.Themes)
+            {
+                if (String.IsNullOrWhiteSpace(t.PreviewImageUrl) ||
+                    !Uri.IsWellFormedUriString(t.PreviewImageUrl, UriKind.Absolute)) continue;
+                string key = Key(t);
+                try { ImageLibrary.Call("AddImage", t.PreviewImageUrl, key, (ulong)0); }
+                catch (Exception e) { PrintWarning("Preview " + t.Name + ": " + e.Message); }
+            }
+        }
+        private string Key(Theme t)
+        {
+            return !String.IsNullOrWhiteSpace(t.PreviewImageKey)
+                ? t.PreviewImageKey : "nunusbuild_" + t.Grade.ToLowerInvariant() + "_" + t.SkinId;
+        }
         [ChatCommand("nunusbuild")]
-        private void Open(BasePlayer player, string command, string[] args)
+        private void Open(BasePlayer player, string cmd, string[] args)
         {
-            if (!CanUse(player)) { SendReply(player, "Sem permissão: nunusbuildingthemes.use"); return; }
-            selectedGrade[player.userID] = "Stone";
-            page[player.userID] = 0;
+            if (!CanUse(player)) { SendReply(player, "Sem permissão para NunusBuild."); return; }
+            tabs[player.userID] = "Wood";
+            pages[player.userID] = 0;
             Draw(player);
+        }
+        // Public API for NunusHub (direct plugin call, no chat injection).
+        [HookMethod("OpenFor")]
+        public void OpenFor(BasePlayer player)
+        {
+            if (player != null) Open(player, "nunusbuild", new string[0]);
         }
         [ConsoleCommand("nunusbuild.action")]
         private void Action(ConsoleSystem.Arg arg)
         {
-            BasePlayer player = arg.Player();
-            if (!CanUse(player) || arg.Args == null || arg.Args.Length < 1) return;
+            var player = arg.Player();
+            if (!CanUse(player) || arg.Args == null || arg.Args.Length == 0) return;
             string action = arg.Args[0].ToString();
             if (action == "close") { CuiHelper.DestroyUi(player, Root); return; }
             string grade;
-            if (!selectedGrade.TryGetValue(player.userID, out grade)) return;
-            if (action == "grade" && arg.Args.Length == 2)
+            if (!tabs.TryGetValue(player.userID, out grade)) return;
+            if (action == "tab" && arg.Args.Length == 2)
             {
-                string requested = arg.Args[1].ToString();
-                if (requested != "Wood" && requested != "Stone" && requested != "Metal" && requested != "TopTier") return;
-                selectedGrade[player.userID] = requested;
-                page[player.userID] = 0;
+                string next = arg.Args[1].ToString();
+                if (next != "Wood" && next != "Stone" && next != "Metal" && next != "TopTier") return;
+                tabs[player.userID] = next; pages[player.userID] = 0;
             }
             else if (action == "page" && arg.Args.Length == 2)
             {
                 int delta;
-                if (!int.TryParse(arg.Args[1].ToString(), out delta) || (delta != 1 && delta != -1)) return;
-                page[player.userID] = Math.Max(0, page[player.userID] + delta);
+                if (!int.TryParse(arg.Args[1].ToString(), out delta) || Math.Abs(delta) != 1) return;
+                pages[player.userID] = Math.Max(0, pages[player.userID] + delta);
             }
             else if (action == "pick" && arg.Args.Length == 2)
             {
-                int index;
-                if (!int.TryParse(arg.Args[1].ToString(), out index) || index < 0) return;
-                var options = settings.Themes.Where(t => t.Grade == grade && (t.SkinId != 0 || t.Name == "Padrão")).ToList();
-                if (index >= options.Count) return;
-                if (options[index].SkinId == 0 && options[index].Name != "Padrão")
-                {
-                    SendReply(player, "Tema sem SkinId verificado. Selecione um tema disponível.");
-                    return;
-                }
-                SetPreference(player.userID, grade, options[index].SkinId);
-                SendReply(player, "Tema selecionado: " + options[index].Name + ". Aplicação automática apenas durante teste administrativo habilitado.");
+                ulong skin;
+                if (!ulong.TryParse(arg.Args[1].ToString(), out skin)) return;
+                if (FindTheme(grade, skin) == null) return;
+                SetPreference(player.userID, grade, skin);
+                SendReply(player, "Tema escolhido: " + FindTheme(grade, skin).Name +
+                    (Testing() && Admin(player) ? " (teste ativo; próximo upgrade será estilizado)" :
+                        " (pré-selecionado; aplicação só durante teste administrativo ativo)"));
             }
             Draw(player);
         }
         [ConsoleCommand("nunusbuild.test")]
         private void Test(ConsoleSystem.Arg arg)
         {
-            var player = arg.Player();
-            if (player == null || !IsAdmin(player)) return;
-            if (!settings.EnableTemporaryTestApplication) { SendReply(player, "Teste desativado no config. Ative explicitamente apenas em servidor de testes."); return; }
+            BasePlayer player = arg.Player();
+            if (player == null || !Admin(player)) return;
             if (arg.Args == null || arg.Args.Length != 1) return;
             int minutes;
             if (!int.TryParse(arg.Args[0].ToString(), out minutes)) return;
-            if (minutes <= 0) { testingUntilUtc = DateTime.MinValue; SendReply(player, "Aplicação de teste desligada."); return; }
-            minutes = Math.Min(minutes, settings.MaximumTestMinutes);
-            testingUntilUtc = DateTime.UtcNow.AddMinutes(minutes);
-            SendReply(player, "Teste temporário ativado por " + minutes + " minutos. Apenas upgrades feitos por administradores serão afetados.");
+            if (minutes <= 0) { testingUntil = DateTime.MinValue; SendReply(player, "Teste encerrado."); return; }
+            if (!settings.EnableTemporaryTestApplication)
+            {
+                SendReply(player, "Habilite EnableTemporaryTestApplication no JSON primeiro."); return;
+            }
+            int allowed = Math.Min(minutes, settings.MaximumTestMinutes);
+            testingUntil = DateTime.UtcNow.AddMinutes(allowed);
+            SendReply(player, "Teste de construção ativo por " + allowed + " minutos (apenas admin). Use /nunusbuild para escolher.");
         }
-        // After a successful, paid in-game upgrade, only for an explicitly enabled,
-        // temporary test and only when the player has administrative permission.
+        // Called AFTER a normal successful upgrade; regular material cost remains intact.
         private void OnStructureUpgraded(BuildingBlock block, BasePlayer player, BuildingGrade.Enum grade, ulong originalSkin)
         {
-            if (block == null || player == null || !IsAdmin(player) || !settings.EnableTemporaryTestApplication || DateTime.UtcNow >= testingUntilUtc) return;
-            string key = GradeFromEnum(grade);
+            if (block == null || player == null || !Admin(player) || !Testing()) return;
+            string key = GradeKey(grade);
             if (key == null) return;
-            ulong skin = Preference(player.userID, key);
-            if (skin == 0 || !IsListed(key, skin)) return;
-            block.skinID = skin;
-            block.UpdateSkin();
-            block.SendNetworkUpdate();
+            ulong desired = Preference(player.userID, key);
+            if (desired == 0 || FindTheme(key, desired) == null) return;
+            ulong blockId = block.net != null ? block.net.ID.Value : 0UL;
+            NextTick(() =>
+            {
+                if (block == null || block.IsDestroyed || player == null) return;
+                if (GradeKey(block.grade) != key) return;
+                if (!Testing()) return;
+                block.skinID = desired;
+                block.UpdateSkin();
+                block.SendNetworkUpdate();
+                Puts("Applied building theme " + desired + " (" + key + ") to block " + blockId + " for " + player.userID);
+            });
         }
-        private string Coord(float n) => n.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
-        private string Rect(float a, float b) => Coord(a) + " " + Coord(b);
-        private void Label(CuiElementContainer c, string parent, string value, string min, string max, int size = 14)
+        private static string Coord(float x) { return x.ToString("0.####", CultureInfo.InvariantCulture); }
+        private static string XY(float x, float y) { return Coord(x) + " " + Coord(y); }
+        private void Label(CuiElementContainer c, string parent, string value, string min, string max, int size = 13)
         {
-            c.Add(new CuiLabel { Text = { Text = value, FontSize = size, Align = TextAnchor.MiddleCenter, Color = "0.95 0.97 1 1" }, RectTransform = { AnchorMin = min, AnchorMax = max } }, parent);
+            c.Add(new CuiLabel { Text = { Text = value, FontSize = size, Align = TextAnchor.MiddleCenter, Color = "0.96 0.97 1 1" }, RectTransform = { AnchorMin = min, AnchorMax = max } }, parent);
         }
-        private void Button(CuiElementContainer c, string parent, string value, string command, string min, string max, string color = "0.17 0.27 0.37 1")
+        private void Button(CuiElementContainer c, string parent, string value, string command, string min, string max, string color = "0.19 0.29 0.41 1")
         {
-            c.Add(new CuiButton { Button = { Color = color, Command = command }, Text = { Text = value, FontSize = 13, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }, RectTransform = { AnchorMin = min, AnchorMax = max } }, parent);
+            c.Add(new CuiButton { Button = { Color = color, Command = command }, Text = { Text = value, FontSize = 12, Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" }, RectTransform = { AnchorMin = min, AnchorMax = max } }, parent);
         }
         private void Draw(BasePlayer player)
         {
             if (!CanUse(player)) return;
             string grade;
-            if (!selectedGrade.TryGetValue(player.userID, out grade)) return;
+            if (!tabs.TryGetValue(player.userID, out grade)) return;
             CuiHelper.DestroyUi(player, Root);
             var c = new CuiElementContainer();
-            c.Add(new CuiPanel { Image = { Color = "0.06 0.09 0.13 0.98" }, RectTransform = { AnchorMin = "0.13 0.13", AnchorMax = "0.87 0.87" }, CursorEnabled = true }, "Overlay", Root);
-            Label(c, Root, "NUNUS BUILD  |  TEMAS DE CONSTRUÇÃO", "0.04 0.92", "0.87 0.99", 20);
-            Button(c, Root, "X", "nunusbuild.action close", "0.93 0.93", "0.985 0.985", "0.6 0.15 0.17 1");
-            var grades = new[] { "Wood", "Stone", "Metal", "TopTier" };
+            c.Add(new CuiPanel { Image = { Color = "0.06 0.09 0.13 0.96" }, RectTransform = { AnchorMin = "0.12 0.12", AnchorMax = "0.88 0.88" }, CursorEnabled = true }, "Overlay", Root);
+            Label(c, Root, "NUNUS BUILD  |  TEMAS DE CONSTRUÇÃO", "0.04 0.91", "0.86 0.99", 19);
+            Button(c, Root, "X", "nunusbuild.action close", "0.92 0.92", "0.98 0.98", "0.58 0.15 0.17 1");
+            string[] grades = { "Wood", "Stone", "Metal", "TopTier" };
+            string[] labels = { "MADEIRA", "PEDRA", "METAL", "BLINDADO" };
             for (int i = 0; i < grades.Length; i++)
             {
-                float x = 0.035f + i * 0.244f;
-                Button(c, Root, GradeName(grades[i]), "nunusbuild.action grade " + grades[i], Rect(x, 0.84f), Rect(x + 0.228f, 0.905f), grade == grades[i] ? "0.19 0.42 0.62 1" : "0.17 0.24 0.31 1");
+                float x = 0.03f + i * 0.246f;
+                Button(c, Root, labels[i], "nunusbuild.action tab " + grades[i], XY(x, 0.835f), XY(x + 0.23f, 0.90f), grade == grades[i] ? "0.19 0.43 0.66 1" : "0.17 0.25 0.33 1");
             }
-            var options = settings.Themes.Where(t => t.Grade == grade && (t.SkinId != 0 || t.Name == "Padrão")).ToList();
-            int pages = Math.Max(1, (options.Count + 5) / 6);
-            int current = Math.Min(Math.Max(0, page.ContainsKey(player.userID) ? page[player.userID] : 0), pages - 1);
-            page[player.userID] = current;
-            ulong currentChoice = Preference(player.userID, grade);
-            for (int i = 0; i < 6; i++)
+            var options = settings.Themes.Where(t => t.Grade == grade).ToList();
+            int count = Math.Max(1, (options.Count + PageSize - 1) / PageSize);
+            int current = Math.Min(Math.Max(0, pages.ContainsKey(player.userID) ? pages[player.userID] : 0), count - 1);
+            pages[player.userID] = current;
+            ulong active = Preference(player.userID, grade);
+            for (int i = 0; i < PageSize; i++)
             {
-                int index = current * 6 + i;
-                if (index >= options.Count) break;
-                Theme theme = options[index];
+                int idx = current * PageSize + i;
+                if (idx >= options.Count) break;
+                Theme t = options[idx];
                 int col = i % 3, row = i / 3;
-                float x = 0.035f + col * 0.326f;
+                float x = 0.032f + col * 0.327f;
                 float top = 0.79f - row * 0.34f;
-                string tile = c.Add(new CuiPanel { Image = { Color = "0.12 0.17 0.23 1" }, RectTransform = { AnchorMin = Rect(x, top - 0.32f), AnchorMax = Rect(x + 0.31f, top) } }, Root);
+                string tile = c.Add(new CuiPanel { Image = { Color = "0.12 0.17 0.23 1" }, RectTransform = { AnchorMin = XY(x, top - 0.32f), AnchorMax = XY(x + 0.308f, top) } }, Root);
                 string image = null;
-                if (ImageLibrary != null)
+                if (ImageLibrary != null && !String.IsNullOrWhiteSpace(t.PreviewImageUrl))
                 {
-                    try
-                    {
-                        string key = PreviewKey(theme);
-                        var found = ImageLibrary.Call("HasImage", key, (ulong)0);
-                        if (found is bool && (bool)found)
-                            image = ImageLibrary.Call("GetImage", key, (ulong)0) as string;
-                    }
-                    catch (Exception ex) { PrintWarning("Erro consultando prévia: " + ex.Message); }
+                    try { image = ImageLibrary.Call("GetImage", Key(t), (ulong)0) as string; }
+                    catch { }
                 }
                 if (!String.IsNullOrEmpty(image))
-                    c.Add(new CuiElement { Parent = tile, Components = { new CuiRawImageComponent { Png = image, Color = "1 1 1 1" }, new CuiRectTransformComponent { AnchorMin = "0.2 0.27", AnchorMax = "0.8 0.95" } } });
-                else Label(c, tile, String.IsNullOrWhiteSpace(theme.PreviewImageUrl) ? "Prévia não configurada" : "Carregando prévia...", "0.1 0.31", "0.9 0.88", 12);
-                Label(c, tile, theme.Name + (currentChoice == theme.SkinId && (theme.SkinId != 0 || theme.Name == "Padrão") ? "  [SELECIONADO]" : ""), "0.03 0.16", "0.97 0.30", 12);
-                Button(c, tile, "SELECIONAR", "nunusbuild.action pick " + index, "0.12 0.02", "0.88 0.16", "0.15 0.42 0.27 1");
+                    c.Add(new CuiElement { Parent = tile, Components = { new CuiRawImageComponent { Png = image, Color = "1 1 1 1" }, new CuiRectTransformComponent { AnchorMin = "0.06 0.29", AnchorMax = "0.94 0.94" } } });
+                else Label(c, tile, String.IsNullOrWhiteSpace(t.PreviewImageUrl) ? "Sem prévia cadastrada" : "Imagem carregando", "0.05 0.36", "0.95 0.82", 12);
+                Label(c, tile, t.Name + (active == t.SkinId ? "  [SELECIONADO]" : ""), "0.03 0.16", "0.97 0.28", 11);
+                Button(c, tile, "SELECIONAR", "nunusbuild.action pick " + t.SkinId, "0.12 0.02", "0.88 0.15", "0.13 0.39 0.27 1");
             }
-            Button(c, Root, "ANTERIOR", "nunusbuild.action page -1", "0.28 0.04", "0.44 0.095");
-            Label(c, Root, "Página " + (current + 1) + "/" + pages, "0.44 0.04", "0.56 0.095");
-            Button(c, Root, "PRÓXIMA", "nunusbuild.action page 1", "0.56 0.04", "0.72 0.095");
+            Button(c, Root, "ANTERIOR", "nunusbuild.action page -1", "0.28 0.035", "0.44 0.09");
+            Label(c, Root, "Página " + (current + 1) + "/" + count, "0.45 0.035", "0.55 0.09", 13);
+            Button(c, Root, "PRÓXIMA", "nunusbuild.action page 1", "0.56 0.035", "0.72 0.09");
+            Label(c, Root, Testing() ? "TESTE ATIVO — upgrades de administradores" : "Aplicação desativada — habilite sessão de testes", "0.03 0.003", "0.97 0.03", 10);
             CuiHelper.AddUi(player, c);
         }
     }
