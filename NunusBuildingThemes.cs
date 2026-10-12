@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("NunusBuildingThemes", "Rust dos Nunus", "2.0.0")]
+    [Info("NunusBuildingThemes", "Rust dos Nunus", "2.1.0")]
     [Description("Visual construction theme selector with separately enabled, time-limited mechanics testing.")]
     public class NunusBuildingThemes : RustPlugin
     {
@@ -22,6 +22,7 @@ namespace Oxide.Plugins
         private Data saved;
         private Settings settings;
         private DateTime testingUntilUtc = DateTime.MinValue;
+        private readonly HashSet<string> queuedPreviews = new HashSet<string>();
 
         private class Theme
         {
@@ -29,6 +30,7 @@ namespace Oxide.Plugins
             [JsonProperty("Grade")] public string Grade;
             [JsonProperty("SkinId")] public ulong SkinId;
             [JsonProperty("PreviewImageKey")] public string PreviewImageKey;
+            [JsonProperty("PreviewImageUrl")] public string PreviewImageUrl;
         }
         private class Settings
         {
@@ -71,6 +73,49 @@ namespace Oxide.Plugins
             try { saved = Interface.Oxide.DataFileSystem.ReadObject<Data>(Name); }
             catch { saved = new Data(); }
             if (saved == null || saved.Preferences == null) saved = new Data();
+        }
+        private void OnServerInitialized() { timer.Once(3f, RegisterPreviews); }
+        private void OnPluginLoaded(Plugin plugin)
+        {
+            if (plugin != null && plugin.Name == "ImageLibrary")
+                timer.Once(2f, RegisterPreviews);
+        }
+        private void RegisterPreviews()
+        {
+            if (ImageLibrary == null || settings == null || settings.Themes == null) return;
+            foreach (var theme in settings.Themes)
+            {
+                if (theme == null || String.IsNullOrWhiteSpace(theme.PreviewImageUrl)) continue;
+                if (!Uri.IsWellFormedUriString(theme.PreviewImageUrl, UriKind.Absolute)) continue;
+                Uri url;
+                if (!Uri.TryCreate(theme.PreviewImageUrl, UriKind.Absolute, out url) || url.Scheme != Uri.UriSchemeHttps) continue;
+                string key = PreviewKey(theme);
+                if (queuedPreviews.Contains(key)) continue;
+                bool cached = false;
+                try { var found = ImageLibrary.Call("HasImage", key, (ulong)0); cached = found is bool && (bool)found; }
+                catch (Exception ex) { PrintWarning("Image Library indisponível: " + ex.Message); }
+                if (cached) continue;
+                queuedPreviews.Add(key);
+                try
+                {
+                    ImageLibrary.Call("AddImage", theme.PreviewImageUrl, key, (ulong)0, new Action(() =>
+                    {
+                        foreach (var player in BasePlayer.activePlayerList)
+                            if (player != null && player.IsConnected && selectedGrade.ContainsKey(player.userID)) Draw(player);
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    queuedPreviews.Remove(key);
+                    PrintWarning("Falha ao registrar imagem de " + theme.Name + ": " + ex.Message);
+                }
+            }
+        }
+        private string PreviewKey(Theme theme)
+        {
+            return !String.IsNullOrWhiteSpace(theme.PreviewImageKey)
+                ? theme.PreviewImageKey
+                : "nunusbuild_" + theme.Grade.ToLowerInvariant() + "_" + theme.SkinId;
         }
         private void SaveData() { Interface.Oxide.DataFileSystem.WriteObject(Name, saved); }
         private void Unload()
@@ -142,8 +187,13 @@ namespace Oxide.Plugins
             {
                 int index;
                 if (!int.TryParse(arg.Args[1].ToString(), out index) || index < 0) return;
-                var options = settings.Themes.Where(t => t.Grade == grade).ToList();
+                var options = settings.Themes.Where(t => t.Grade == grade && (t.SkinId != 0 || t.Name == "Padrão")).ToList();
                 if (index >= options.Count) return;
+                if (options[index].SkinId == 0 && options[index].Name != "Padrão")
+                {
+                    SendReply(player, "Tema sem SkinId verificado. Selecione um tema disponível.");
+                    return;
+                }
                 SetPreference(player.userID, grade, options[index].SkinId);
                 SendReply(player, "Tema selecionado: " + options[index].Name + ". Aplicação automática apenas durante teste administrativo habilitado.");
             }
@@ -202,7 +252,7 @@ namespace Oxide.Plugins
                 float x = 0.035f + i * 0.244f;
                 Button(c, Root, GradeName(grades[i]), "nunusbuild.action grade " + grades[i], Rect(x, 0.84f), Rect(x + 0.228f, 0.905f), grade == grades[i] ? "0.19 0.42 0.62 1" : "0.17 0.24 0.31 1");
             }
-            var options = settings.Themes.Where(t => t.Grade == grade).ToList();
+            var options = settings.Themes.Where(t => t.Grade == grade && (t.SkinId != 0 || t.Name == "Padrão")).ToList();
             int pages = Math.Max(1, (options.Count + 5) / 6);
             int current = Math.Min(Math.Max(0, page.ContainsKey(player.userID) ? page[player.userID] : 0), pages - 1);
             page[player.userID] = current;
@@ -217,14 +267,21 @@ namespace Oxide.Plugins
                 float top = 0.79f - row * 0.34f;
                 string tile = c.Add(new CuiPanel { Image = { Color = "0.12 0.17 0.23 1" }, RectTransform = { AnchorMin = Rect(x, top - 0.32f), AnchorMax = Rect(x + 0.31f, top) } }, Root);
                 string image = null;
-                if (ImageLibrary != null && !String.IsNullOrEmpty(theme.PreviewImageKey))
+                if (ImageLibrary != null)
                 {
-                    try { image = ImageLibrary.Call("GetImage", theme.PreviewImageKey, (ulong)0) as string; } catch { }
+                    try
+                    {
+                        string key = PreviewKey(theme);
+                        var found = ImageLibrary.Call("HasImage", key, (ulong)0);
+                        if (found is bool && (bool)found)
+                            image = ImageLibrary.Call("GetImage", key, (ulong)0) as string;
+                    }
+                    catch (Exception ex) { PrintWarning("Erro consultando prévia: " + ex.Message); }
                 }
                 if (!String.IsNullOrEmpty(image))
                     c.Add(new CuiElement { Parent = tile, Components = { new CuiRawImageComponent { Png = image, Color = "1 1 1 1" }, new CuiRectTransformComponent { AnchorMin = "0.2 0.27", AnchorMax = "0.8 0.95" } } });
-                else Label(c, tile, "PREVIA\nConfigure PreviewImageKey", "0.1 0.31", "0.9 0.88", 12);
-                Label(c, tile, theme.Name + (currentChoice == theme.SkinId ? "  [SELECIONADO]" : ""), "0.03 0.16", "0.97 0.30", 12);
+                else Label(c, tile, String.IsNullOrWhiteSpace(theme.PreviewImageUrl) ? "Prévia não configurada" : "Carregando prévia...", "0.1 0.31", "0.9 0.88", 12);
+                Label(c, tile, theme.Name + (currentChoice == theme.SkinId && (theme.SkinId != 0 || theme.Name == "Padrão") ? "  [SELECIONADO]" : ""), "0.03 0.16", "0.97 0.30", 12);
                 Button(c, tile, "SELECIONAR", "nunusbuild.action pick " + index, "0.12 0.02", "0.88 0.16", "0.15 0.42 0.27 1");
             }
             Button(c, Root, "ANTERIOR", "nunusbuild.action page -1", "0.28 0.04", "0.44 0.095");
