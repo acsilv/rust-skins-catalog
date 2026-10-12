@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("NunusDecor", "Rust dos Nunus", "1.0.0")]
+    [Info("NunusDecor", "Rust dos Nunus", "1.1.0")]
     [Description("Catálogo visual de decor packs com UI, prévias e ações configuráveis para servidor de testes.")]
     public class NunusDecor : RustPlugin
     {
@@ -34,6 +34,8 @@ namespace Oxide.Plugins
             [JsonProperty("Description")] public string Description;
             [JsonProperty("PreviewImageUrl")] public string PreviewImageUrl;
             [JsonProperty("PreviewImageKey")] public string PreviewImageKey;
+            [JsonProperty("ItemShortname")] public string ItemShortname;
+            [JsonProperty("SkinId")] public ulong SkinId;
             [JsonProperty("Commands")] public List<string> Commands = new List<string>();
             [JsonProperty("AdminOnly")] public bool AdminOnly = true;
         }
@@ -202,47 +204,43 @@ namespace Oxide.Plugins
 
         private void RunItem(BasePlayer player, string id)
         {
-            var item = GetItem(id);
+            var entry = GetItem(id);
+            if (entry == null) return;
+            if (!configData.EnableExecutionButtons || !IsAdminDecor(player))
+            {
+                SendReply(player, "Entrega disponível somente para administradores autorizados.");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(entry.ItemShortname))
+            {
+                SendReply(player, "Este objeto ainda não possui um item válido mapeado. Configure ItemShortname no NunusDecor.json.");
+                return;
+            }
+
+            var definition = ItemManager.FindItemDefinition(entry.ItemShortname);
+            if (definition == null)
+            {
+                SendReply(player, "Shortname não encontrado no servidor: " + entry.ItemShortname);
+                return;
+            }
+
+            Item item = ItemManager.Create(definition, 1, entry.SkinId);
             if (item == null)
             {
-                SendReply(player, "Item não encontrado.");
+                SendReply(player, "O servidor não conseguiu criar esse item.");
                 return;
             }
 
-            if (!configData.EnableExecutionButtons)
+            if (!player.inventory.GiveItem(item, player.inventory.containerMain))
             {
-                SendReply(player, "Os botões de execução estão desabilitados no config.");
+                item.Remove();
+                SendReply(player, "Não foi possível entregar o item. Libere espaço no inventário.");
                 return;
             }
 
-            if (!IsAdminDecor(player))
-            {
-                SendReply(player, "Este item é somente para administradores/testes.");
-                return;
-            }
-
-            if (item.Commands == null || item.Commands.Count == 0)
-            {
-                SendReply(player, "Este item ainda não tem comandos configurados no NunusDecor.json.");
-                return;
-            }
-
-            var pos = player.transform.position;
-            foreach (var raw in item.Commands)
-            {
-                if (string.IsNullOrWhiteSpace(raw)) continue;
-                string cmd = raw
-                    .Replace("{steamid}", player.UserIDString)
-                    .Replace("{userid}", player.UserIDString)
-                    .Replace("{name}", player.displayName ?? "player")
-                    .Replace("{x}", pos.x.ToString("0.00", CultureInfo.InvariantCulture))
-                    .Replace("{y}", pos.y.ToString("0.00", CultureInfo.InvariantCulture))
-                    .Replace("{z}", pos.z.ToString("0.00", CultureInfo.InvariantCulture));
-
-                rust.RunServerCommand(cmd);
-            }
-
-            SendReply(player, "Ação executada para: " + item.Name);
+            SendReply(player, "Recebido: " + entry.Name + " (" + definition.shortname + ")");
+            Puts("NunusDecor entregou " + definition.shortname + " skin=" + entry.SkinId + " para " + player.userID);
         }
 
         private DecorItem GetItem(string id)
@@ -391,7 +389,8 @@ namespace Oxide.Plugins
 
                 AddLabel(ui, tile, item.Name, "0.03 0.18", "0.97 0.31", 12);
                 AddLabel(ui, tile, item.Category ?? "Decor", "0.03 0.10", "0.97 0.18", 10);
-                AddButton(ui, tile, "DETALHES", "nunusdecor.action details " + item.Id, "0.08 0.02", "0.92 0.10", "0.13 0.39 0.27 1", 12);
+                AddButton(ui, tile, "VER", "nunusdecor.action details " + item.Id, "0.08 0.02", "0.47 0.10", "0.19 0.29 0.41 1", 11);
+                AddButton(ui, tile, "RECEBER", "nunusdecor.action run " + item.Id, "0.53 0.02", "0.92 0.10", "0.13 0.39 0.27 1", 11);
             }
 
             AddButton(ui, Root, "ANTERIOR", "nunusdecor.action page -1", "0.30 0.03", "0.43 0.08");
@@ -453,9 +452,9 @@ namespace Oxide.Plugins
             string desc = string.IsNullOrWhiteSpace(item.Description) ? "Sem descrição." : item.Description;
             AddLabel(ui, detail, desc, "0.53 0.43", "0.95 0.78", 13, TextAnchor.UpperLeft);
 
-            string info = item.Commands != null && item.Commands.Count > 0
-                ? "Comandos configurados: " + item.Commands.Count
-                : "Nenhum comando configurado ainda";
+            string info = string.IsNullOrWhiteSpace(item.ItemShortname)
+                ? "Item ainda não mapeado no servidor"
+                : "Item: " + item.ItemShortname + " | Skin: " + item.SkinId;
             AddLabel(ui, detail, info, "0.53 0.29", "0.95 0.37", 12, TextAnchor.MiddleLeft);
 
             string adminText = item.AdminOnly ? "Somente admin/testes" : "Liberado para todos com permissão";
@@ -464,7 +463,7 @@ namespace Oxide.Plugins
             if (configData.EnableExecutionButtons)
             {
                 string color = (item.AdminOnly && !IsAdminDecor(player)) ? "0.30 0.30 0.30 1" : "0.13 0.39 0.27 1";
-                AddButton(ui, detail, "EXECUTAR / ENTREGAR", "nunusdecor.action run " + item.Id, "0.58 0.10", "0.90 0.18", color, 14);
+                AddButton(ui, detail, "RECEBER NO INVENTÁRIO", "nunusdecor.action run " + item.Id, "0.58 0.10", "0.90 0.18", color, 14);
             }
         }
 
@@ -487,7 +486,7 @@ namespace Oxide.Plugins
                 new DecorItem { Id="exhibit_wall_cabinet", Pack="Exhibit", Name="Wall Cabinet", Category="Storage", Description="Armário de parede do Exhibit Decor Pack.", AdminOnly=true },
                 new DecorItem { Id="exhibit_fabric_beanbag_seat", Pack="Exhibit", Name="Fabric Beanbag Seat", Category="Furniture", Description="Puff do Exhibit Decor Pack.", AdminOnly=true },
                 new DecorItem { Id="exhibit_chandelier", Pack="Exhibit", Name="Chandelier", Category="Lighting", Description="Lustre do Exhibit Decor Pack.", AdminOnly=true },
-                new DecorItem { Id="exhibit_fairy_lights", Pack="Exhibit", Name="Fairy Lights", Category="Lighting", Description="Luzes decorativas do Exhibit Decor Pack.", AdminOnly=true },
+                new DecorItem { Id="exhibit_fairy_lights", Pack="Exhibit", Name="Fairy Lights", ItemShortname="electric.fairylights", Category="Lighting", Description="Luzes decorativas do Exhibit Decor Pack.", AdminOnly=true },
                 new DecorItem { Id="exhibit_bulb_string_lights", Pack="Exhibit", Name="Bulb String Lights", Category="Lighting", Description="Cordão de lâmpadas do Exhibit Decor Pack.", AdminOnly=true },
                 new DecorItem { Id="exhibit_spot_light", Pack="Exhibit", Name="Spot Light", Category="Lighting", Description="Spot light do Exhibit Decor Pack.", AdminOnly=true },
                 new DecorItem { Id="exhibit_tripod_spot_light", Pack="Exhibit", Name="Tripod Spot Light", Category="Lighting", Description="Spot light com tripé do Exhibit Decor Pack.", AdminOnly=true },
